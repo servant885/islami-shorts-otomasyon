@@ -8,13 +8,56 @@ OUT = Path('output'); OUT.mkdir(exist_ok=True)
 
 def topic():
     key = os.environ['GEMINI_API_KEY']
-    prompt = '''Türkçe İslami kısa video için gençlerin gündelik hayatına uygun, yaratıcı bir konu seç. Sabit konu listesi kullanma. Bir ayet ve bir SAHİH hadis için açık kaynak (sure/ayet, hadis eseri/numarası) ver. Emin değilsen içerik uydurma, hata döndür. Metinler kısa olsun. JSON anahtarları tam olarak name,hook,verse,hadith,advice. JSON dışında hiçbir şey yazma. Ayet/hadis metinlerini kısa anlam aktarımı olarak belirt.'''
-    r = requests.post('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent', headers={'x-goog-api-key':key},json={'contents':[{'parts':[{'text':prompt}]}],'generationConfig':{'responseMimeType':'application/json','temperature':0.95}},timeout=60)
-    r.raise_for_status(); data=json.loads(r.json()['candidates'][0]['content']['parts'][0]['text'])
-    if not all(isinstance(data.get(k),str) and data[k].strip() for k in ('name','hook','verse','hadith','advice')): raise ValueError('Eksik içerik')
-    return data
+    base = 'https://generativelanguage.googleapis.com/v1beta'
+    session = requests.Session()
+    headers = {'x-goog-api-key': key}
+    listing = session.get(f'{base}/models', headers=headers, timeout=30)
+    if not listing.ok:
+        raise RuntimeError(f'Gemini model listesi alınamadı ({listing.status_code}): {listing.text[:350]}')
+    models = [m['name'] for m in listing.json().get('models', [])
+              if 'generateContent' in m.get('supportedGenerationMethods', [])
+              and 'gemini' in m.get('name', '').lower()]
+    models.sort(key=lambda m: (not any(x in m for x in ('flash', 'lite')), 'preview' in m, m))
+    if not models:
+        raise RuntimeError('API anahtarına açık generateContent modeli bulunamadı.')
+    prompt = ("Türkçe İslami kısa video için gençlerin gündelik hayatına uygun yaratıcı bir konu seç. "
+              "Bir ayet ve sahih hadis için sure/ayet, eser/hadis numarası belirt. "
+              "Emin olmadığın metni uydurma. Kısa anlam aktarımı kullan. "
+              "Sadece name, hook, verse, hadith, advice anahtarları olan JSON döndür.")
+    payload = {'contents': [{'parts': [{'text': prompt}]}],
+               'generationConfig': {'responseMimeType': 'application/json', 'temperature': 0.9}}
+    for model in models:
+        r = session.post(f'{base}/{model}:generateContent', headers=headers,
+                         json=payload, timeout=90)
+        if r.status_code in (404, 400):
+            print('Model kullanılamadı:', model, r.status_code)
+            continue
+        if not r.ok:
+            raise RuntimeError(f'Gemini {r.status_code}: {r.text[:500]}')
+        raw = r.json()['candidates'][0]['content']['parts'][0]['text']
+        data = json.loads(raw)
+        if not all(isinstance(data.get(k), str) and data[k].strip()
+                   for k in ('name', 'hook', 'verse', 'hadith', 'advice')):
+            raise ValueError('Gemini eksik içerik üretti.')
+        print('Gemini modeli:', model)
+        return data
+    raise RuntimeError('Listelenen modellerin hiçbiri içerik üretemedi.')
 
-def background():
+def fallback_background():
+    # No external stock footage: animated, abstract sky/landscape gradients.
+    # drawbox + moving gradients generated from FFmpeg sources.
+    subprocess.run([
+        'ffmpeg', '-y', '-f', 'lavfi',
+        '-i', 'color=c=0x173c55:s=540x960:r=25:d=80',
+        '-vf', "drawbox=x=0:y=550:w=iw:h=410:color=0x123a34:t=fill,"
+               "drawbox=x=0:y=720:w=iw:h=240:color=0x09251f:t=fill,"
+               "drawbox=x='150+75*sin(t/5)':y='180+25*cos(t/6)':w=110:h=110:color=0xf4c980@0.35:t=fill,"
+               "scale=1080:1920,format=yuv420p",
+        '-t', '80', '-c:v', 'libx264', '-preset', 'ultrafast',
+        str(OUT / 'nature.mp4')
+    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def pixabay_background():
     key=os.environ['PIXABAY_API_KEY']; session=requests.Session()
     for term in random.sample(['mountains','ocean','forest','waterfall','clouds','landscape'],6):
         r=session.get('https://pixabay.com/api/videos/',params={'key':key,'q':term,'per_page':20,'safesearch':'true'},timeout=30)
@@ -35,7 +78,17 @@ def background():
                                 if chunk: f.write(chunk)
                     if path.stat().st_size>10000: return hit.get('pageURL','')
                 except (requests.RequestException,OSError) as e: print('Video indirilemedi:',e)
-    raise RuntimeError('Pixabay erişimi engellendi. Tekrar tekrar denemek yerine lisanslı yerel video kullanın.')
+    print('Pixabay erişilemedi; yedek hareketli arka plan hazırlanıyor.')
+    fallback_background()
+    return 'Generated abstract nature-inspired background (no external footage)' 
+
+def background():
+    try:
+        return pixabay_background()
+    except (requests.RequestException, RuntimeError, OSError) as e:
+        print('Pixabay hatası:', e)
+        fallback_background()
+        return 'Generated abstract nature-inspired background'
 
 def cards(t):
     values=[t['hook'],t['verse'],t['hadith'],t['advice']+'\nFaydalıysa paylaş.']
